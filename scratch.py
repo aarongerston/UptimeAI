@@ -332,6 +332,7 @@ to_date_posix = str(int(datetime(year=2025, month=1, day=2).timestamp()))
 data_src = ""  # ("bgp", "merit-nt", "gtr", "gtr-norm", "ping-slash24")
 
 country = "Spain"
+continent_codes = [item["code"] for item in metadata if item["type"] == "continent"]
 region_codes = [
     item["code"] for item in metadata if
     item["type"] == "region" and
