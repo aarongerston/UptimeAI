@@ -180,101 +180,6 @@ def calc_features(df: pd.DataFrame):
 
     return df
 
-    # unique_cities = df["city"].unique()
-    # df_clean = df.dropna(subset=['latitude', 'longitude']).copy()  # drop rows with null long/lat
-    #
-    # # Precompute nearby cities for each city (only need to do this once)
-    # nearby_cities_dict = {}
-    # for city in tqdm(unique_cities, desc="Computing nearby cities", leave=False):
-    #     target_row = df_clean[df_clean['city'] == city]
-    #     if not target_row.empty:
-    #         target_coords = target_row[['latitude', 'longitude']].values[0]
-    #         nearby_cities_dict[city] = df_clean.loc[
-    #             df_clean.apply(lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= 50, axis=1),
-    #             'city'
-    #         ].unique()
-    #     else:
-    #         nearby_cities_dict[city] = []  # No valid coordinates for city
-    #
-    # # Apply function with tqdm progress bar
-    # tqdm.pandas(desc="Computing anomaly scores (1h)", leave=False)
-    # df['feature_nearby_anomaly_score_1h'] = df.progress_apply(
-    #     lambda x: df[
-    #         (df['timestamp'] <= x['timestamp']) &
-    #         (df['timestamp'] > x['timestamp'] - pd.Timedelta(hours=1)) &
-    #         (df['city'].isin(nearby_cities_dict.get(x['city'], [])))
-    #         ][[c for c in df.columns if c.startswith("metric_")]].std().mean(),
-    #     axis=1
-    # )
-    # tqdm.pandas(desc="Computing anomaly scores (15m)", leave=False)
-    # df['feature_nearby_anomaly_score_15m'] = df.progress_apply(
-    #     lambda x: df[
-    #         (df['timestamp'] <= x['timestamp']) &
-    #         (df['timestamp'] > x['timestamp'] - pd.Timedelta(minutes=15)) &
-    #         (df['city'].isin(nearby_cities_dict.get(x['city'], [])))
-    #         ][[c for c in df.columns if c.startswith("metric_")]].std().mean(),
-    #     axis=1
-    # )
-
-    # # Precompute nearby cities for each city
-    # for city in unique_cities:
-    #     target_row = df_clean[df_clean['city'] == city]
-    #     if not target_row.empty:
-    #         target_coords = target_row[['latitude', 'longitude']].values[0]
-    #         nearby_cities = df_clean.loc[
-    #             df_clean.apply(lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= 150, axis=1),
-    #             'city'
-    #         ].unique()
-    #         nearby_cities_dict[city] = nearby_cities
-    #     else:
-    #         nearby_cities_dict[city] = []  # No nearby cities if no valid coordinates
-    #
-    # # Compute anomaly scores per city & timestamp window
-    # timestamps = df_clean['timestamp'].unique()
-    # city_anomaly_scores_1h = {}
-    # city_anomaly_scores_15m = {}
-    # pbar1 = tqdm(unique_cities, leave=False, position=1)
-    # for city in pbar1:
-    #     pbar1.set_description(city)
-    #     pbar2 = tqdm(timestamps, position=0, leave=False, desc="Calculating nearby indicators")
-    #     for timestamp in pbar2:
-    #         nearby_cities = nearby_cities_dict[city]
-    #         if len(nearby_cities) == 0:
-    #             city_anomaly_scores_1h[(city, timestamp)] = np.nan  # No nearby cities => No anomaly score
-    #             city_anomaly_scores_15m[(city, timestamp)] = np.nan  # No nearby cities => No anomaly score
-    #             continue
-    #
-    #         nearby_data_1h = df_clean[
-    #             (df_clean['timestamp'] <= timestamp) &
-    #             (df_clean['timestamp'] > timestamp - pd.Timedelta(hours=1)) &
-    #             (df_clean['city'].isin(nearby_cities))
-    #             ]
-    #         nearby_data_15m = df_clean[
-    #             (df_clean['timestamp'] <= timestamp) &
-    #             (df_clean['timestamp'] > timestamp - pd.Timedelta(minutes=15)) &
-    #             (df_clean['city'].isin(nearby_cities))
-    #             ]
-    #
-    #         # Compute standard deviation of metric columns
-    #         anomaly_score_1h = nearby_data_1h[[c for c in df_clean.columns if c.startswith("metric_")]].std().mean()
-    #         city_anomaly_scores_1h[(city, timestamp)] = anomaly_score_1h
-    #         anomaly_score_15m = nearby_data_15m[[c for c in df_clean.columns if c.startswith("metric_")]].std().mean()
-    #         city_anomaly_scores_15m[(city, timestamp)] = anomaly_score_15m
-    #
-    # # Convert to DataFrame
-    # anomaly_df_1h = pd.DataFrame.from_dict(city_anomaly_scores_1h, orient='index',
-    #                                        columns=['feature_nearby_anomaly_score_1h'])
-    # anomaly_df_1h.index = pd.MultiIndex.from_tuples(anomaly_df_1h.index, names=["city", "timestamp"])
-    # anomaly_df_1h.reset_index(inplace=True)
-    # anomaly_df_15m = pd.DataFrame.from_dict(city_anomaly_scores_15m, orient='index',
-    #                                         columns=['feature_nearby_anomaly_score_1h'])
-    # anomaly_df_15m.index = pd.MultiIndex.from_tuples(anomaly_df_15m.index, names=["city", "timestamp"])
-    # anomaly_df_15m.reset_index(inplace=True)
-    #
-    # # Merge the precomputed anomaly scores into the main DataFrame
-    # df = df.merge(anomaly_df_1h, on=["city", "timestamp"], how="left")
-    # df = df.merge(anomaly_df_15m, on=["city", "timestamp"], how="left")
-
 
 def model_anomalies(df: pd.DataFrame):
 
@@ -352,8 +257,15 @@ def model_anomalies(df: pd.DataFrame):
     vae.fit(X, X, epochs=10, batch_size=32)
 
     df['vae_reconstruction_error'] = ((X - vae.predict(X)) ** 2).mean(axis=1)
-    df['outage_likelihood'] = (df['vae_reconstruction_error'] - df['vae_reconstruction_error'].min()) / (
-                df['vae_reconstruction_error'].max() - df['vae_reconstruction_error'].min())
+
+    # Remove outliers
+    lower_bound = df['vae_reconstruction_error'].quantile(1 / 100)
+    upper_bound = df['vae_reconstruction_error'].quantile(99 / 100)
+    df['vae_reconstruction_error_clipped'] = df['vae_reconstruction_error'].clip(lower_bound, upper_bound)
+
+    # Apply Min-Max Scaling after clipping
+    df['outage_likelihood'] = (df['vae_reconstruction_error_clipped'] - df['vae_reconstruction_error_clipped'].min()) / (
+                                df['vae_reconstruction_error_clipped'].max() - df['vae_reconstruction_error_clipped'].min())
 
     # Visualization:
     plt.figure(figsize=(12, 5))
