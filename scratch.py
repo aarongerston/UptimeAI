@@ -1,16 +1,24 @@
-import numpy as np
+
+import joblib
+import warnings
 import requests
+import numpy as np
 import pandas as pd
 import seaborn as sns
+from tqdm import tqdm
 from warnings import warn
 import matplotlib.pyplot as plt
 from geopy.distance import great_circle
 from datetime import datetime, timedelta
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import IsolationForest
 from sklearn.mixture import GaussianMixture
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
 from tensorflow.keras import layers, models, Input
 
+import matplotlib
+matplotlib.use("TkAgg")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # IODA API Endpoint
 API_URL = "https://api.ioda.inetintel.cc.gatech.edu/v2/"
@@ -76,7 +84,7 @@ def merge_sources_into_df(data: list[dict]):
         df = pd.concat([df, df_region], ignore_index=True)
 
     # Convert dictionary to DataFrame
-    df.sort_values(by=["timestamp", "city"], inplace=True)
+    df.sort_values(by=["city", "timestamp"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     # df.fillna(0, inplace=True)  # Replace missing values with 0
 
@@ -90,65 +98,236 @@ def merge_sources_into_df(data: list[dict]):
     df["latitude"] = df.apply(lambda x: coords.get((x["city"], x["country_code"]), (None, None))[0], axis=1)
     df["longitude"] = df.apply(lambda x: coords.get((x["city"], x["country_code"]), (None, None))[1], axis=1)
 
+    df.dropna(subset = ['longitude', 'latitude'], inplace=True)
+
     return df
 
 
-def find_nearby_cities(df: pd.DataFrame, target_city: str, radius_km: float=50):
+def find_nearby_cities(df: pd.DataFrame, target_city: str, radius_km: float=100):
 
-    target_coords = df[df['city'] == target_city][['latitude', 'longitude']].values[0]
-    nearby_cities = df[df.apply(lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= radius_km, axis=1)]['city'].unique()
+    # Ensure the target city exists in the cleaned DataFrame
+    target_row = df[df['city'] == target_city]
+
+    if target_row.empty:
+        print(f"Warning: No valid coordinates found for {target_city}. Returning empty list.")
+        return []
+
+    # Extract target coordinates
+    target_coords = target_row[['latitude', 'longitude']].values[0]
+
+    # Compute distances only for valid locations
+    nearby_cities = df[df.apply(
+        lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= radius_km, axis=1
+    )]['city'].unique()
 
     return nearby_cities
 
 
 def calc_features(df: pd.DataFrame):
 
-    # Create rolling statistics features
-    for col in [c for c in df.columns if c.startswith("metric_")]:
-        df[f"{col}_rolling_mean"] = df.groupby("city")[col].rolling(window=3).mean().reset_index(drop=True)
-        df[f"{col}_rolling_std"] = df.groupby("city")[col].rolling(window=3).std().reset_index(drop=True)
-        df[f"{col}_pct_change"] = df[col].pct_change()
+    # Scale metrics:
+    metrics = [c for c in df.columns if c.startswith("metric_")]
+    scaler = RobustScaler()  # scales using median and IQR
+    df[metrics] = scaler.fit_transform(df[metrics])
+    joblib.dump(scaler, "scaler.pkl")  # Stores scaler as a .pkl file to be used during inference
 
-    # Calculate nearby city network anomaly influence
-    df['feature_nearby_anomaly_score_1h'] = (
-        df.apply(lambda x:
-                 df[(df['timestamp'] <= x['timestamp']) &
-                    (df['timestamp'] > x['timestamp'] - pd.Timedelta(hours=1)) &
-                    (df['city'].isin(find_nearby_cities(df, x['city'], radius_km=50)))][
-                     [c for c in df.columns if c.startswith("metric_")]].std().mean(),
-                 axis=1))
-    df['feature_nearby_anomaly_score_15m'] = (
-        df.apply(lambda x:
-                 df[(df['timestamp'] <= x['timestamp']) &
-                    (df['timestamp'] > x['timestamp'] - pd.Timedelta(minutes=15)) &
-                    (df['city'].isin(find_nearby_cities(df, x['city'], radius_km=50)))][
-                     [c for c in df.columns if c.startswith("metric_")]].std().mean(),
-                 axis=1))
+    # Calculate MAD over last 3 values for each metric
+    n_timesteps = 3
+    for metric in metrics:
+        df[f"calc_{metric.split('_')[1]}_mad"] = df[metric].rolling(window=n_timesteps, min_periods=2).apply(
+            lambda x: np.nanmedian(np.abs(x - np.nanmedian(x))), raw=True
+        )
 
-    df.dropna(inplace=True)
+    # Calculate an overall MAD score:
+    mad_cols = [c for c in df.columns if "calc_" in c and "_mad" in c]
+    df["calc_avg_mad"] = df[mad_cols].mean(axis=1)
+
+    # # Create lagged features (previous 15 mins)
+    feature_cols = [col for col in df.columns if col.startswith("calc_")]
+    max_lag = 15  # minutes
+    time_diffs = df["timestamp"].diff().dt.total_seconds().dropna()
+    time_step = int(np.nanmedian(time_diffs))  # seconds
+    n_lags = max(1, max_lag // (time_step // 60))  # Ensure at least 1 lag is used
+    for lag in range(1, n_lags + 1):  # Lags 1, 2, 3
+        for col in feature_cols:
+            feature = col.split("_")[1]
+            df[f"{feature}_lag_{int(lag * time_step // 60)}m"] = df.groupby("city")[col].shift(lag)
+
+    # Calculate recent overall variability in nearby areas
+    df_clean = df.dropna(subset=['latitude', 'longitude']).copy()
+    iterator = tqdm(df['city'].unique(), desc="Finding nearby cities", leave=False)
+    nearby_cities_dict = {city: find_nearby_cities(df_clean, city, radius_km=150) for city in iterator}
+    # Create a new DataFrame to store nearby city aggregated features
+    lag_cols = [c for c in df.columns if "_lag_" in c]
+    df_nearby_list = []
+    for city in df["city"].unique():
+        nearby_cities = nearby_cities_dict.get(city, [])
+        if not any(nearby_cities):
+            continue  # Skip if there are no nearby cities
+        # Filter df for only nearby cities
+        df_nearby_subset = df[df["city"].isin(nearby_cities)]
+        # Compute the mean of lagged features for nearby cities per timestamp
+        df_nearby_agg = df_nearby_subset.groupby("timestamp", as_index=False)[lag_cols].mean()
+        df_nearby_agg.rename(columns={col: f"feature_{col}_nearby" for col in lag_cols}, inplace=True)
+        # Assign the computed values to the original city
+        df_nearby_agg["city"] = city  # Keeps "city" column intact
+        df_nearby_list.append(df_nearby_agg)
+
+    # Concatenate all computed nearby city data
+    df_nearby = pd.concat(df_nearby_list, ignore_index=True)
+    # Merge back with original df without duplicate city columns
+    df = df.merge(df_nearby, on=["city", "timestamp"], how="left")
+
+    return df
+
+    # unique_cities = df["city"].unique()
+    # df_clean = df.dropna(subset=['latitude', 'longitude']).copy()  # drop rows with null long/lat
+    #
+    # # Precompute nearby cities for each city (only need to do this once)
+    # nearby_cities_dict = {}
+    # for city in tqdm(unique_cities, desc="Computing nearby cities", leave=False):
+    #     target_row = df_clean[df_clean['city'] == city]
+    #     if not target_row.empty:
+    #         target_coords = target_row[['latitude', 'longitude']].values[0]
+    #         nearby_cities_dict[city] = df_clean.loc[
+    #             df_clean.apply(lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= 50, axis=1),
+    #             'city'
+    #         ].unique()
+    #     else:
+    #         nearby_cities_dict[city] = []  # No valid coordinates for city
+    #
+    # # Apply function with tqdm progress bar
+    # tqdm.pandas(desc="Computing anomaly scores (1h)", leave=False)
+    # df['feature_nearby_anomaly_score_1h'] = df.progress_apply(
+    #     lambda x: df[
+    #         (df['timestamp'] <= x['timestamp']) &
+    #         (df['timestamp'] > x['timestamp'] - pd.Timedelta(hours=1)) &
+    #         (df['city'].isin(nearby_cities_dict.get(x['city'], [])))
+    #         ][[c for c in df.columns if c.startswith("metric_")]].std().mean(),
+    #     axis=1
+    # )
+    # tqdm.pandas(desc="Computing anomaly scores (15m)", leave=False)
+    # df['feature_nearby_anomaly_score_15m'] = df.progress_apply(
+    #     lambda x: df[
+    #         (df['timestamp'] <= x['timestamp']) &
+    #         (df['timestamp'] > x['timestamp'] - pd.Timedelta(minutes=15)) &
+    #         (df['city'].isin(nearby_cities_dict.get(x['city'], [])))
+    #         ][[c for c in df.columns if c.startswith("metric_")]].std().mean(),
+    #     axis=1
+    # )
+
+    # # Precompute nearby cities for each city
+    # for city in unique_cities:
+    #     target_row = df_clean[df_clean['city'] == city]
+    #     if not target_row.empty:
+    #         target_coords = target_row[['latitude', 'longitude']].values[0]
+    #         nearby_cities = df_clean.loc[
+    #             df_clean.apply(lambda x: great_circle(target_coords, (x['latitude'], x['longitude'])).km <= 150, axis=1),
+    #             'city'
+    #         ].unique()
+    #         nearby_cities_dict[city] = nearby_cities
+    #     else:
+    #         nearby_cities_dict[city] = []  # No nearby cities if no valid coordinates
+    #
+    # # Compute anomaly scores per city & timestamp window
+    # timestamps = df_clean['timestamp'].unique()
+    # city_anomaly_scores_1h = {}
+    # city_anomaly_scores_15m = {}
+    # pbar1 = tqdm(unique_cities, leave=False, position=1)
+    # for city in pbar1:
+    #     pbar1.set_description(city)
+    #     pbar2 = tqdm(timestamps, position=0, leave=False, desc="Calculating nearby indicators")
+    #     for timestamp in pbar2:
+    #         nearby_cities = nearby_cities_dict[city]
+    #         if len(nearby_cities) == 0:
+    #             city_anomaly_scores_1h[(city, timestamp)] = np.nan  # No nearby cities => No anomaly score
+    #             city_anomaly_scores_15m[(city, timestamp)] = np.nan  # No nearby cities => No anomaly score
+    #             continue
+    #
+    #         nearby_data_1h = df_clean[
+    #             (df_clean['timestamp'] <= timestamp) &
+    #             (df_clean['timestamp'] > timestamp - pd.Timedelta(hours=1)) &
+    #             (df_clean['city'].isin(nearby_cities))
+    #             ]
+    #         nearby_data_15m = df_clean[
+    #             (df_clean['timestamp'] <= timestamp) &
+    #             (df_clean['timestamp'] > timestamp - pd.Timedelta(minutes=15)) &
+    #             (df_clean['city'].isin(nearby_cities))
+    #             ]
+    #
+    #         # Compute standard deviation of metric columns
+    #         anomaly_score_1h = nearby_data_1h[[c for c in df_clean.columns if c.startswith("metric_")]].std().mean()
+    #         city_anomaly_scores_1h[(city, timestamp)] = anomaly_score_1h
+    #         anomaly_score_15m = nearby_data_15m[[c for c in df_clean.columns if c.startswith("metric_")]].std().mean()
+    #         city_anomaly_scores_15m[(city, timestamp)] = anomaly_score_15m
+    #
+    # # Convert to DataFrame
+    # anomaly_df_1h = pd.DataFrame.from_dict(city_anomaly_scores_1h, orient='index',
+    #                                        columns=['feature_nearby_anomaly_score_1h'])
+    # anomaly_df_1h.index = pd.MultiIndex.from_tuples(anomaly_df_1h.index, names=["city", "timestamp"])
+    # anomaly_df_1h.reset_index(inplace=True)
+    # anomaly_df_15m = pd.DataFrame.from_dict(city_anomaly_scores_15m, orient='index',
+    #                                         columns=['feature_nearby_anomaly_score_1h'])
+    # anomaly_df_15m.index = pd.MultiIndex.from_tuples(anomaly_df_15m.index, names=["city", "timestamp"])
+    # anomaly_df_15m.reset_index(inplace=True)
+    #
+    # # Merge the precomputed anomaly scores into the main DataFrame
+    # df = df.merge(anomaly_df_1h, on=["city", "timestamp"], how="left")
+    # df = df.merge(anomaly_df_15m, on=["city", "timestamp"], how="left")
 
 
 def model_anomalies(df: pd.DataFrame):
 
     features = [c for c in df.columns if c.startswith("metric_") or c.startswith("feature_")]
 
+    # Impute missing data
+    imputer = SimpleImputer(strategy='mean')
+    X = pd.DataFrame(imputer.fit_transform(df[features]), columns=features)
+
     # 1. Isolation Forest anomaly detection
     print("Training Isolation Forest...")
     iso_forest = IsolationForest(contamination=0.05, random_state=42)
-    df['iso_anomaly_score'] = iso_forest.fit_predict(df[features])
+    df['iso_anomaly_score'] = iso_forest.fit_predict(X)
     df['iso_anomaly_score'] = df['iso_anomaly_score'].apply(lambda x: 1 if x == -1 else 0)
 
     # 2. GMM for outage probability
     print("Training GMM...")
-    imputer = SimpleImputer(strategy='mean')
-    df_imputed = pd.DataFrame(imputer.fit_transform(df[features]), columns=features)
-    gmm = GaussianMixture(n_components=2, random_state=42)
-    df['gmm_score'] = gmm.fit_predict(df_imputed)
-    df['outage_probability'] = gmm.predict_proba(df_imputed)[:, 1]
+
+    # Test different numbers of components
+    bic_scores = []
+    aic_scores = []
+    components_range = list(range(1, X.shape[1]))  # Try from 1 to n_features components
+    for n in components_range:
+        gmm = GaussianMixture(n_components=n, random_state=42)
+        gmm.fit(X)
+
+        bic_scores.append(gmm.bic(X))
+        aic_scores.append(gmm.aic(X))
+
+    plt.figure(figsize=(10, 5))
+    plt.ion()
+    plt.plot(components_range, bic_scores, label="BIC", marker='o')
+    plt.plot(components_range, aic_scores, label="AIC", marker='s')
+    plt.xlabel("Number of Components")
+    plt.ylabel("BIC / AIC Score")
+    plt.legend()
+    plt.title("Choosing the Optimal Number of Components in GMM")
+    plt.show(block=False)
+
+    # Locate the elbow
+    # try:
+    #     n_components = components_range[np.argwhere(np.diff(np.diff(bic_scores)) < 0)[0][0]]
+    # except IndexError:
+    n_components = components_range[np.argmax(np.diff(np.diff(bic_scores))) + 1]
+
+    gmm = GaussianMixture(n_components=n_components, random_state=42)
+    df['gmm_score'] = gmm.fit_predict(X)
+    df["gmm_prediction"] = df["gmm_score"] != 0
+    # df['outage_probability'] = gmm.predict_proba(X)[:, 1]
 
     # 3. Variational Autoencoder for outage likelihood
     print("Training VAE...")
-    input_dim = df[features].shape[1]
+    input_dim = X.shape[1]
     input_layer = Input(shape=(input_dim,))
 
     encoder = models.Sequential([
@@ -170,25 +349,52 @@ def model_anomalies(df: pd.DataFrame):
     vae = models.Model(inputs=input_layer, outputs=decoded)
 
     vae.compile(optimizer='adam', loss='mse')
-    vae.fit(df[features], df[features], epochs=10, batch_size=32)
+    vae.fit(X, X, epochs=10, batch_size=32)
 
-    df['vae_reconstruction_error'] = ((df[features] - vae.predict(df[features])) ** 2).mean(axis=1)
+    df['vae_reconstruction_error'] = ((X - vae.predict(X)) ** 2).mean(axis=1)
     df['outage_likelihood'] = (df['vae_reconstruction_error'] - df['vae_reconstruction_error'].min()) / (
                 df['vae_reconstruction_error'].max() - df['vae_reconstruction_error'].min())
 
     # Visualization:
     plt.figure(figsize=(12, 5))
+    plt.ion()
     df_mini = df[df["city"] == "Valencia"]
     plt.plot(df_mini['timestamp'], df_mini['outage_likelihood'], label="VAE")
     plt.plot(df_mini['timestamp'], df_mini['iso_anomaly_score'], label="Isolation Forest")
-    plt.plot(df_mini['timestamp'], df_mini['outage_probability'], label="GMM")
+    plt.plot(df_mini['timestamp'], df_mini['gmm_prediction'], label="GMM")
     plt.axhline(y=0.8, color='r', linestyle='--', label="High Risk Threshold")
     plt.xlabel("Time")
     plt.ylabel("Outage Likelihood Score")
     plt.title("Network Outage Likelihood Over Time")
     plt.legend()
-    plt.show(block=True)
+    plt.show(block=False)
     breakpoint()
+
+
+def plot_features(df: pd.DataFrame, features: list[str], region: str):
+
+    f1, axs = plt.subplots(nrows=2, ncols=len(features), figsize=(12, 5), constrained_layout=True)
+    for n_metric, metric in enumerate(features):
+        dataset = df[df["city"] == region][metric]
+        metric_name = " ".join(metric.split("_")[1:])
+
+        # Time-series plot of network activity
+        ax = axs[0, n_metric]
+        sns.lineplot(data=df, x="timestamp", y=dataset, ax=ax)
+        ax.set_xlabel("Datetime")
+        ax.set_ylabel("Value") if n_metric == 0 else None
+        ax.set_title(metric_name)
+        ax.tick_params(axis="x", labelrotation=45)
+
+        # Histogram of activity levels
+        ax = axs[1, n_metric]
+        sns.histplot(dataset, bins=30, kde=True, ax=ax)
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Frequency")
+
+    [ax.sharex(axs[0, 0]) for ax in axs[0]]  # top row shares x-axes
+    plt.suptitle(region)
+    plt.show(block=False)
 
 
 # Define valid codes:
@@ -209,8 +415,8 @@ if response.status_code == 200:
     """
 
 # Define date range, region, desired signal
-from_date_posix = str(int(datetime(year=2024, month=1, day=1).timestamp()))
-to_date_posix = str(int(datetime(year=2025, month=1, day=1).timestamp()))
+from_date_posix = str(int(datetime(year=2024, month=12, day=31).timestamp()))
+to_date_posix = str(int(datetime(year=2025, month=1, day=2).timestamp()))
 data_src = ""  # ("bgp", "merit-nt", "gtr", "gtr-norm", "ping-slash24")
 
 country = "Spain"
@@ -243,38 +449,16 @@ else:
 
 """ Example: BCN """
 
-region = "Valencia"
 # example_data = [item for item in data if item[0]["entityName"] == region][0]
 df = merge_sources_into_df(data)
 
-# Display basic statistics
-print("\nBasic Data Overview:")
-print(df[[c for c in df.columns if c.startswith("metric_")]].info())
-print("\nSummary Statistics:")
-print(df[[c for c in df.columns if c.startswith("metric_")]].describe())
+df = calc_features(df)
 
-f1, axs = plt.subplots(nrows=2, ncols=3, figsize=(12, 5), constrained_layout=True)
-for n_metric, metric in enumerate([c for c in df.columns if c.startswith("metric")]):
-
-    dataset = df[df["city"] == region][metric]
-    metric_name = metric.split("_")[1]
-
-    # Time-series plot of network activity
-    ax = axs[0, n_metric]
-    sns.lineplot(data=df, x="timestamp", y=dataset, ax=ax)
-    ax.set_xlabel("Datetime")
-    ax.set_ylabel("Value")
-    ax.set_title(metric_name)
-    ax.tick_params(axis="x", labelrotation=45)
-
-    # Histogram of activity levels
-    ax = axs[1, n_metric]
-    sns.histplot(dataset, bins=30, kde=True, ax=ax)
-    ax.set_xlabel("Value")
-    ax.set_ylabel("Frequency")
-
-plt.suptitle(region)
-plt.show(block=True)
+features = [c for c in df.columns if c.startswith(("metric_", "feature_"))]
+plt.ion()
+region = "Valencia"
+plot_features(df, features=[c for c in df.columns if c.startswith("metric_")], region=region)
+plot_features(df, features=[c for c in df.columns if c.startswith("feature_")], region=region)
 breakpoint()
 
 model_anomalies(df)
