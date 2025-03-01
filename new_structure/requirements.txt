@@ -1,0 +1,10 @@
+numpy
+pandas
+requests
+tqdm
+geopy
+matplotlib
+seaborn
+scikit-learn
+tensorflow
+joblib
