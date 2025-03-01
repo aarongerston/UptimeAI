@@ -6,20 +6,48 @@ Contains functions to create and transform feature sets
 aggregations based on nearby cities).
 """
 
+import os
+import joblib
 import logging
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from sklearn.preprocessing import RobustScaler
-import joblib
+from sklearn.preprocessing import StandardScaler
 
-from data_processing import find_nearby_cities
+from functions.data_processing import find_nearby_cities
 
 logger = logging.getLogger(__name__)
 
 
+def scale(df: pd.DataFrame, columns: list, scaler_path: str) -> None:
+    """
+    Modifies `columns` of `df` with a StandardScaler.
+    If a file already exists at `scaler_path`, it is loaded and applied. Otherwise, a new scaler is fitted and saved to
+    `scaler_path`.
+
+    :param df: DataFrame containing columns defined in `columns`
+    :param columns: list of column names to which to apply scaler
+    :param scaler_path: local path to which to save/load scaler
+    :return: None
+    """
+
+    # 1. Scale metrics with RobustScaler
+    if os.path.exists(scaler_path):
+        # If the scaler path exists, load the scaler and transform the data:
+        scaler = joblib.load(scaler_path)
+        df[columns] = scaler.transform(df[columns])
+    else:
+        # If the scaler path does not exist, fit a new scaler to the data and save the scaler to the specified path:
+        logger.info("Scaling raw metric columns with RobustScaler.")
+        scaler = StandardScaler()
+        df[columns] = scaler.fit_transform(df[columns])
+        joblib.dump(scaler, scaler_path)
+
+
 def calc_features(
-    df: pd.DataFrame, scale_output_path: str = "scaler.pkl"
+        df: pd.DataFrame,
+        metric_scaler_path: str = "metric_scaler.pkl",
+        feature_scaler_path: str = "feature_scaler.pkl",
 ) -> pd.DataFrame:
     """
     Calculate rolling statistics, lagged features, and scale metrics in-place.
@@ -27,7 +55,7 @@ def calc_features(
 
     :param df: Input DataFrame with columns
                [timestamp, city, country_code, metric_*, latitude, longitude]
-    :param scale_output_path: Path to save the fitted scaler
+    :param scaler_path: Path to load/save the fitted scaler (if the path exists, load; if not, save)
     :return: DataFrame with new feature columns.
     """
     # Identify metric columns
@@ -38,11 +66,8 @@ def calc_features(
         )
         return df
 
-    # 1. Scale metrics with RobustScaler
-    logger.info("Scaling raw metric columns with RobustScaler.")
-    scaler = RobustScaler()
-    df[metrics] = scaler.fit_transform(df[metrics])
-    joblib.dump(scaler, scale_output_path)
+    # 1. Apply StandardScaler to data
+    scale(df, columns=metrics, scaler_path=metric_scaler_path)
 
     # 2. Calculate rolling MAD for each metric
     n_timesteps = 3
@@ -94,7 +119,7 @@ def calc_features(
     city_list = df_clean["city"].unique()
     nearby_cities_dict = {
         city: find_nearby_cities(df_clean, city, radius_km=150)
-        for city in tqdm(city_list)
+        for city in tqdm(city_list, total=len(city_list))
     }
 
     # Create aggregated features for each timestamp from neighbors
@@ -126,4 +151,9 @@ def calc_features(
         df = pd.merge(df, df_nearby, on=["city", "timestamp"], how="left")
 
     df.drop(columns=["time_diff"], inplace=True, errors="ignore")
+
+    # Scale features
+    features = [c for c in df.columns if c.startswith("feature_")]
+    scale(df, columns=features, scaler_path=feature_scaler_path)
+
     return df

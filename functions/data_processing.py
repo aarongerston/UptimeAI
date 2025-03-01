@@ -6,16 +6,15 @@ and adding geocoding information (city latitude & longitude).
 Also includes helper functions for distance-based lookups.
 """
 
-import logging
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from geopy.distance import great_circle
 from warnings import warn
 from typing import Tuple, Optional
+from geopy.distance import great_circle
+from datetime import datetime, timedelta
 
-from config import logger
+from functions.config import logger
 
 
 def get_city_coords(
@@ -51,16 +50,17 @@ def get_city_coords(
         if results:
             return results[0]["latitude"], results[0]["longitude"]
 
-    warn(f"Coordinates of {city}, {country_code} not found.")
+    # warn(f"Coordinates of {city}, {country_code} not found.")
     return None, None
 
 
-def merge_sources_into_df(data: list) -> pd.DataFrame:
+def merge_sources_into_df(data: list, labels: list = ()) -> pd.DataFrame:
     """
     Merge multiple source signals from the IODA response into a single DataFrame.
     Also fetch city coordinates for each row.
 
     :param data: List of lists/dicts, each containing 'datasource', 'from', 'step', 'values', 'entityName'
+    :param labels: List of outage events containing 'start', 'duration', 'location_name'
     :return: A DataFrame with columns [timestamp, city, country_code, metric_*, latitude, longitude]
     """
     df = pd.DataFrame()
@@ -118,6 +118,15 @@ def merge_sources_into_df(data: list) -> pd.DataFrame:
     # Sort and reset index
     df.sort_values(by=["city", "timestamp"], inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    # Add outage event labels (if provided)
+    if any(labels):
+        df["label"] = False
+        for item in labels:
+            region = item["location_name"]
+            start = datetime.fromtimestamp(item["start"])
+            end = start + timedelta(seconds=item["duration"])
+            df.loc[(df["city"] == region) & (df["timestamp"] >= start) & (df["timestamp"] <= end), "label"] = True
 
     # Collect unique (city, country_code) pairs
     unique_cities = df[["city", "country_code"]].drop_duplicates()

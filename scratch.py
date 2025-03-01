@@ -155,7 +155,8 @@ def calc_features(df: pd.DataFrame):
 
     # Calculate recent overall variability in nearby areas
     df_clean = df.dropna(subset=['latitude', 'longitude']).copy()
-    iterator = tqdm(df['city'].unique(), desc="Finding nearby cities", leave=False)
+    cities = df['city'].unique()
+    iterator = tqdm(cities, desc="Finding nearby cities", leave=False, total=len(cities))
     nearby_cities_dict = {city: find_nearby_cities(df_clean, city, radius_km=150) for city in iterator}
     # Create a new DataFrame to store nearby city aggregated features
     lag_cols = [c for c in df.columns if "_lag_" in c]

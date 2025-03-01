@@ -3,8 +3,7 @@ numpy
 geopy
 pandas
 joblib
-fastapi
-uvicorn
-requests
+seaborn
 tensorflow
+matplotlib
 scikit-learn

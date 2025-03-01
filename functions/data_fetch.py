@@ -52,3 +52,32 @@ def fetch_signal_data(
     except requests.RequestException as e:
         logger.error(f"Error fetching data from IODA API: {e}")
         return []
+
+
+def fetch_outage_data(
+        entity_code: str,
+        from_date: str,
+        to_date: str,
+        entity_type: str = "region",
+) -> dict:
+
+    endpoint = f"outages/events/"
+    params = {
+        "from": from_date,
+        "until": to_date,
+        "entityCode": entity_code,
+        "entityType": entity_type,
+        "includeAlerts": "true",
+        "overall": "true",
+    }
+    url = API_URL + endpoint
+    try:
+        response = requests.get(url, params=params, timeout=60)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        logger.info("Data successfully fetched from IODA API.")
+        return data
+    except requests.RequestException as e:
+        logger.error(f"Error fetching data from IODA API: {e}")
+        return {}
+

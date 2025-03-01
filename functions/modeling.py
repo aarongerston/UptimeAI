@@ -6,17 +6,17 @@ Implements various anomaly detection algorithms
 Includes functions for plotting results.
 """
 
+import joblib
 import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import joblib
 
+import tensorflow as tf
 from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import IsolationForest
 from tensorflow.keras import layers, models
-from tensorflow.keras.models import load_model
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ def fit_gmm(
 
 
 def fit_vae(
-    df: pd.DataFrame, features: list[str], vae_model_path: str = "vae_model"
+    df: pd.DataFrame, features: list[str], vae_model_path: str = "vae_model.pkl"
 ) -> pd.DataFrame:
     """
     Fits a simple Variational Autoencoder for anomaly detection
@@ -177,18 +177,23 @@ def plot_anomaly_results(
         logger.warning(f"No data found for city: {city_name}")
         return
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(df_city["timestamp"], df_city["outage_likelihood"], label="VAE Likelihood")
-    plt.plot(
-        df_city["timestamp"], df_city["iso_anomaly_flag"], label="Isolation Forest Flag"
-    )
-    plt.plot(df_city["timestamp"], df_city["gmm_is_anomalous"], label="GMM Flag")
-    plt.axhline(y=0.8, linestyle="--", label="High Risk Threshold")
-    plt.xlabel("Time")
-    plt.ylabel("Anomaly Score / Likelihood")
-    plt.title(f"Anomaly Indicators for {city_name}")
-    plt.legend()
-    plt.tight_layout()
+    fig, axs = plt.subplots(2, 1, figsize=(12, 6), sharex=True, constrained_layout=True)
+    axs[0].plot(df_city["timestamp"], df_city["outage_likelihood"], label="VAE Likelihood")
+    axs[0].plot(df_city["timestamp"], df_city["iso_anomaly_flag"], label="Isolation Forest Flag")
+    axs[0].plot(df_city["timestamp"], df_city["gmm_is_anomalous"], label="GMM Flag")
+    for metric in [c for c in df_city.columns if c.startswith("metric")]:
+        df_metric = df_city[df[metric].notna()]
+        metric_std = [0]*len(df_metric) if np.nanstd(df_metric[metric]) == 0 \
+            else (df_metric[metric] - np.nanmean(df_metric[metric])) / np.nanstd(df_metric[metric])
+        axs[1].plot(df_metric["timestamp"], metric_std, label=metric)
+    axs[0].axhline(y=0.8, linestyle="--", label="High Risk Threshold")
+    axs[0].set_xlabel("")
+    axs[1].set_xlabel("Time")
+    axs[0].set_ylabel("Anomaly Score / Likelihood")
+    axs[1].set_ylabel("Standardized value")
+    axs[0].set_title(f"Anomaly Indicators for {city_name}")
+    axs[0].legend()
+    axs[1].legend()
 
     # Save the figure
     plt.savefig(output_fig)

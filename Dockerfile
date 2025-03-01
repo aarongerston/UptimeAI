@@ -8,14 +8,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 # Copy the application files
-COPY aux.py .
-COPY backend.py .
-COPY scaler.pkl .
+COPY api.py .
 COPY backend_reqs.txt .
+COPY backend/ backend/
+COPY functions/ functions/
 
 # Install dependencies
 RUN pip install --no-cache-dir -r backend_reqs.txt
 
 # Run the FastAPI app with Uvicorn
 EXPOSE 8080
-CMD ["uvicorn", "backend:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
