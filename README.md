@@ -6,8 +6,8 @@ UptimeAI is a machine learning project designed to predict upcoming **network ou
 
 ## 🚀 **Project Overview**
 ### **1️⃣ Data Sources**
-- **IODA API** 🛰️ (Network outage signals from multiple data sources)
-- **City Geolocation Data** 🌍 (Latitude/Longitude for regional modeling)
+- [**IODA API**](https://ioda.inetintel.cc.gatech.edu/) 🛰️ (Network outage signals from multiple data sources)
+- [**City Geolocation Data**](https://open-meteo.com/en/docs/geocoding-api) 🌍 (Latitude/Longitude for regional modeling)
 - (Future addition: **OpenWeather API** 🌦️ (For real-time weather impact analysis))
 
 ### **2️⃣ Machine Learning Models**
