@@ -1,0 +1,10 @@
+tqdm
+numpy
+geopy
+pandas
+joblib
+fastapi
+uvicorn
+requests
+tensorflow
+scikit-learn

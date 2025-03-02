@@ -1,0 +1,9 @@
+tqdm
+numpy
+geopy
+pandas
+joblib
+seaborn
+tensorflow
+matplotlib
+scikit-learn
